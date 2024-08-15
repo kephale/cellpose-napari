@@ -58,7 +58,7 @@ def widget_wrapper():
     @no_grad()
     def run_cellpose(image, model_type, custom_model, channels, channel_axis, diameter,
                     net_avg, resample, cellprob_threshold, 
-                    model_match_threshold, do_3D, stitch_threshold):
+                    model_match_threshold, do_3D, stitch_threshold, omni, cluster, mask_threshold):
         from cellpose import models
 
         flow_threshold = (31.0 - model_match_threshold) / 10.
@@ -71,15 +71,19 @@ def widget_wrapper():
         else:
             CP = models.CellposeModel(model_type=model_type, gpu=True)
         masks, flows_orig, _ = CP.eval(image, 
-                                    channels=channels, 
-                                    channel_axis=channel_axis,
-                                    diameter=diameter,
-                                    net_avg=net_avg,
-                                    resample=resample,
-                                    cellprob_threshold=cellprob_threshold,
-                                    flow_threshold=flow_threshold,
-                                    do_3D=do_3D,
-                                    stitch_threshold=stitch_threshold)
+                                       channels=channels, 
+                                       channel_axis=channel_axis,
+                                       diameter=diameter,
+                                       # net_avg=net_avg,
+                                       resample=resample,
+                                       cellprob_threshold=cellprob_threshold,
+                                       flow_threshold=flow_threshold,
+                                       do_3D=do_3D,
+                                       stitch_threshold=stitch_threshold,
+                                       # omni=omni,
+                                       # cluster=cluster,
+                                       # mask_threshold=mask_threshold
+                                       )
         del CP
         if not do_3D and stitch_threshold==0 and masks.ndim > 2:
             flows = [[flows_orig[0][i], 
@@ -100,30 +104,32 @@ def widget_wrapper():
         del CP
         return diam
 
-    @thread_worker 
-    def compute_masks(masks_orig, flows_orig, cellprob_threshold, model_match_threshold):
+    @thread_worker
+    def compute_masks(masks_orig, flows_orig, cellprob_threshold, model_match_threshold, mask_threshold):
         import cv2
         from cellpose.utils import fill_holes_and_remove_small_masks
         from cellpose.dynamics import get_masks
         from cellpose.transforms import resize_image
 
-        #print(flows_orig[3].shape, flows_orig[2].shape, masks_orig.shape)
         flow_threshold = (31.0 - model_match_threshold) / 10.
         if model_match_threshold==0.0:
             flow_threshold = 0.0
             logger.debug('flow_threshold=0 => no masks thrown out due to model mismatch')
-        logger.debug(f'computing masks with cellprob_threshold={cellprob_threshold}, flow_threshold={flow_threshold}')
+        logger.debug(f'computing masks with cellprob_threshold={cellprob_threshold}, flow_threshold={flow_threshold}, mask_threshold={mask_threshold}')
         maski = get_masks(flows_orig[3].copy(), iscell=(flows_orig[2] > cellprob_threshold),
                         flows=flows_orig[1], threshold=flow_threshold*(masks_orig.ndim<3))
         maski = fill_holes_and_remove_small_masks(maski)
         maski = resize_image(maski, masks_orig.shape[-2], masks_orig.shape[-1],
                                         interpolation=cv2.INTER_NEAREST)
-        return maski 
+        return maski
 
     @magicgui(
         call_button='run segmentation',  
         layout='vertical',
-        model_type = dict(widget_type='ComboBox', label='model type', choices=['cyto', 'nuclei', 'cyto2', 'custom'], value='cyto', tooltip='there is a <em>cyto</em> model, a new <em>cyto2</em> model from user submissions, and a <em>nuclei</em> model'),
+        model_type = dict(widget_type='ComboBox', label='model type', 
+                  choices=['cyto', 'cyto2', 'nuclei', 'cyto3', 'tissuenet', 'livecell', 'yeast', 'bact_phase', 'bact_fluor', 'deepbacs', 'custom'], 
+                  value='cyto3', 
+                  tooltip='there are multiple models, select the one that best matches your data'),
         custom_model = dict(widget_type='FileEdit', label='custom model path: ', tooltip='if model type is custom, specify file path to it here'),
         main_channel = dict(widget_type='ComboBox', label='channel to segment', choices=main_channel_choices, value=0, tooltip='choose channel with cells'),
         optional_nuclear_channel = dict(widget_type='ComboBox', label='optional nuclear channel', choices=optional_nuclear_channel_choices, value=0, tooltip='optional, if available, choose channel with nuclei of cells'),
@@ -140,8 +146,11 @@ def widget_wrapper():
         clear_previous_segmentations = dict(widget_type='CheckBox', text='clear previous results', value=True),
         output_flows = dict(widget_type='CheckBox', text='output flows and cellprob', value=True),
         output_outlines = dict(widget_type='CheckBox', text='output outlines', value=True),
+        omni = dict(widget_type='CheckBox', text='omnipose', value=False, tooltip='use omnipose extension for thin or intertwined shapes'),
+        cluster = dict(widget_type='CheckBox', text='cluster', value=False, tooltip='use DBSCAN clustering to automatically segment ROIs'),
+        mask_threshold = dict(widget_type='FloatSlider', name='mask_threshold', value=0.0, min=-6.0, max=6.0, step=0.5, tooltip='threshold on mask pixel values (set higher to get more masks)')
     )
-    def widget(#label_logo, 
+    def widget(
         viewer: Viewer,
         image_layer: Image,
         model_type,
@@ -161,7 +170,10 @@ def widget_wrapper():
         stitch_threshold_3D,
         clear_previous_segmentations,
         output_flows,
-        output_outlines
+        output_outlines,
+        omni,
+        cluster,
+        mask_threshold
     ) -> None:
         # Import when users activate plugin
 
@@ -250,21 +262,23 @@ def widget_wrapper():
             widget.channel_axis = -1
 
         cp_worker = run_cellpose(image=image,
-                                model_type=model_type,
-                                custom_model=str(custom_model.resolve()),
-                                channels=[max(0, main_channel), 
-                                            max(0, optional_nuclear_channel)],
-                                channel_axis=widget.channel_axis, 
-                                diameter=float(diameter),
-                                net_avg=net_average,
-                                resample=resample_dynamics,
-                                cellprob_threshold=cellprob_threshold,
-                                model_match_threshold=model_match_threshold,
-                                do_3D=(process_3D and float(stitch_threshold_3D)==0 and image_layer.ndim>2),
-                                stitch_threshold=float(stitch_threshold_3D) if image_layer.ndim>2 else 0.0)
+                                 model_type=model_type,
+                                 custom_model=str(custom_model.resolve()),
+                                 channels=[max(0, main_channel), 
+                                           max(0, optional_nuclear_channel)],
+                                 channel_axis=widget.channel_axis, 
+                                 diameter=float(diameter),
+                                 net_avg=net_average,
+                                 resample=resample_dynamics,
+                                 cellprob_threshold=cellprob_threshold,
+                                 model_match_threshold=model_match_threshold,
+                                 do_3D=(process_3D and float(stitch_threshold_3D)==0 and image_layer.ndim>2),
+                                 stitch_threshold=float(stitch_threshold_3D) if image_layer.ndim>2 else 0.0,
+                                 omni=omni,
+                                 cluster=cluster,
+                                 mask_threshold=mask_threshold)
         cp_worker.returned.connect(_new_segmentation)
         cp_worker.start()
-
 
     def update_masks(masks):     
         from cellpose.utils import masks_to_outlines
@@ -283,14 +297,13 @@ def widget_wrapper():
         widget.masks_orig = masks
         logger.debug('masks updated')
 
-
     @widget.compute_masks_button.changed.connect 
     def _compute_masks(e: Any):
-        
         mask_worker = compute_masks(widget.masks_orig, 
                                     widget.flows_orig, 
                                     widget.cellprob_threshold.value, 
-                                    widget.model_match_threshold.value)
+                                    widget.model_match_threshold.value,
+                                    widget.mask_threshold.value)
         mask_worker.returned.connect(update_masks)
         mask_worker.start()
 
@@ -335,3 +348,22 @@ def napari_experimental_provide_dock_widget():
     return widget_wrapper, {'name': 'cellpose'}
 
 
+if __name__ == '__main__':
+    import napari
+
+    from napari.utils.translations import trans
+    from cellpose_napari._sample_data import _load_cellpose_data
+    
+    # Create a napari viewer
+    viewer = napari.Viewer()
+
+    # Load the 2D sample data
+    sample_data = _load_cellpose_data('rgb_2D.png', trans._('Cells 2D'))
+
+    image_layer = viewer.add_image(sample_data[0][0])
+
+    # Add the cellpose widget
+    viewer.window.add_dock_widget(widget_wrapper(), name='cellpose')
+
+    # Run the napari viewer
+    # napari.run()
